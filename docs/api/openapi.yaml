@@ -1,0 +1,2944 @@
+openapi: 3.1.0
+info:
+  title: quillsync API
+  version: 1.0.0
+  summary: HTTP and WebSocket API of the quillsync collaborative document editor.
+  description: |
+    Full target API of quillsync. Every operation carries `x-status`:
+
+    - `implemented` — merged, tested, running in CI.
+    - `pending` — the route is registered but returns `501 NOT_IMPLEMENTED` with the
+      ticket ID in `error.details.ticket`; `x-ticket` names the backlog ticket
+      (see docs/planning/backlog.md). The request/response schemas of pending
+      operations are the agreed contract for that ticket.
+
+    All JSON responses use the envelope `{ data, error, meta? }` (see `Envelope`).
+    Authentication is a session cookie (`qs_session`); mutating requests made with
+    a session must also send the CSRF token in `x-csrf-token` (double-submit with
+    the `qs_csrf` cookie). Conventions, the error code table and the WebSocket
+    walkthrough are in docs/api/README.md.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:4104
+    description: Local API (run.sh dev)
+  - url: http://localhost:5104
+    description: Local web dev server; proxies /api (including WebSocket upgrades) to the API
+tags:
+  - name: system
+    description: Liveness, readiness and metrics
+  - name: auth
+    description: Registration, login, sessions, password reset
+  - name: documents
+    description: Document metadata, materialized text, lifecycle
+  - name: collaboration
+    description: WebSocket sync and presence
+  - name: folders
+    description: Folder hierarchy (QS-090)
+  - name: members
+    description: Organization membership and invitations
+  - name: sharing
+    description: Per-document permissions and share links
+  - name: versions
+    description: Snapshots and version history
+  - name: comments
+    description: Anchored comment threads
+  - name: notifications
+    description: In-app notification center
+  - name: search
+    description: Full-text search
+  - name: import-export
+    description: Markdown/HTML export and Markdown import
+  - name: audit
+    description: Audit log query
+
+security:
+  - sessionCookie: []
+
+paths:
+  /api/health:
+    get:
+      operationId: getHealth
+      tags: [system]
+      summary: Liveness probe
+      description: Returns 200 while the process is serving requests. Does not touch the database.
+      x-status: implemented
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/HealthStatus'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/ready:
+    get:
+      operationId: getReadiness
+      tags: [system]
+      summary: Readiness probe
+      description: Returns 200 when the PostgreSQL pool can execute a query; 503 with error code `UNAVAILABLE` otherwise.
+      x-status: implemented
+      security: []
+      responses:
+        '200':
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ReadinessStatus'
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/metrics:
+    get:
+      operationId: getMetrics
+      tags: [system]
+      summary: Prometheus metrics
+      description: Prometheus text exposition (rooms, sockets, ops/s, persist latency). Intended to be reachable only from the host or monitoring network.
+      x-status: pending
+      x-ticket: QS-130
+      responses:
+        '200':
+          description: Metrics in Prometheus text format
+          content:
+            text/plain:
+              schema:
+                type: string
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/auth/register:
+    post:
+      operationId: register
+      tags: [auth]
+      summary: Register an organization and its owner
+      description: Creates the organization, the user (scrypt password hash) and an owner membership in one transaction. To prevent account enumeration the response is identical (202, same body, no cookies) whether or not the email is already registered; the password is hashed on both paths and duplicates are audited as `auth.register_duplicate`. The client signs in afterwards. Rate limited per client IP (`REGISTER_IP_RATE_LIMIT_MAX` per hour). Email-verified signup through the local outbox is planned (QS-140).
+      x-status: implemented
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '202':
+          description: Accepted. Same response for new and already-registered emails.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [status, message]
+                        properties:
+                          status:
+                            type: string
+                            const: accepted
+                          message:
+                            type: string
+                            example: If this email address can be used, your workspace is ready. Sign in to continue.
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/v1/auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: Log in with email and password
+      description: >-
+        Verifies the password, creates a session row (only an HMAC-SHA256 of the token is stored) and sets `qs_session` and `qs_csrf`. Throttled three ways, each attempt reserved before any await: per normalised client IP (`LOGIN_IP_RATE_LIMIT_MAX` per 15 minutes; IPv6 collapsed to /64), distinct emails per IP (`LOGIN_EMAILS_PER_IP_MAX` per 15 minutes), and per email with progressive backoff (`LOGIN_EMAIL_FREE_ATTEMPTS` free attempts, then 30 s doubling to 15 minutes). 429 responses carry `Retry-After`.
+      x-status: implemented
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Signed in
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SessionSetCookie'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Me'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/v1/auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Log out
+      description: Deletes the session row and clears `qs_session` and `qs_csrf`.
+      x-status: implemented
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '200':
+          description: Signed out
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Ok'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+
+  /api/v1/auth/me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Current user, organization, role and CSRF token
+      x-status: implemented
+      responses:
+        '200':
+          description: Current session context
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/v1/auth/password-reset:
+    post:
+      operationId: requestPasswordReset
+      tags: [auth]
+      summary: Request a password reset
+      description: Writes a reset message to the local outbox. Always returns 202 so the response does not reveal whether the email exists.
+      x-status: pending
+      x-ticket: QS-015
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/auth/password-reset/confirm:
+    post:
+      operationId: confirmPasswordReset
+      tags: [auth]
+      summary: Set a new password with a reset token
+      description: Consumes the single-use token, replaces the password hash and revokes every existing session of the user.
+      x-status: pending
+      x-ticket: QS-015
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirm'
+      responses:
+        '200':
+          description: Password changed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/auth/sessions:
+    get:
+      operationId: listSessions
+      tags: [auth]
+      summary: List the current user's active sessions
+      x-status: pending
+      x-ticket: QS-016
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/auth/sessions/{sessionId}:
+    delete:
+      operationId: revokeSession
+      tags: [auth]
+      summary: Revoke one of the current user's sessions
+      description: Deletes the session row; open WebSockets authenticated by it are closed (with QS-056).
+      x-status: pending
+      x-ticket: QS-016
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '204':
+          description: Revoked
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents:
+    get:
+      operationId: listDocuments
+      tags: [documents]
+      summary: List documents in the current organization
+      description: >-
+        Requires `document:read`. Results are scoped to the session's organization and ordered by `updatedAt` descending. Archived documents are excluded. The implemented slice supports `limit` only and returns `meta: {count, limit}`; keyset `cursor` pagination arrives with the pending list endpoints.
+      x-status: implemented
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Documents
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Document'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createDocument
+      tags: [documents]
+      summary: Create an empty document
+      description: Requires `document:create` (owner, editor). Writes an audit_log entry.
+      x-status: implemented
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDocumentRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/documents/import:
+    post:
+      operationId: importDocument
+      tags: [import-export]
+      summary: Import a Markdown file as a new document
+      description: Converts Markdown into CRDT insert runs authored by a server replica and persists them as the document's first op-log batch.
+      x-status: pending
+      x-ticket: QS-112
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '201':
+          description: Imported
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: getDocument
+      tags: [documents]
+      summary: Get document metadata and materialized text
+      description: Requires `document:read`. Returns metadata plus the current text (rehydrated from document_ops), the server state vector and the total op count.
+      x-status: implemented
+      responses:
+        '200':
+          description: Document detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DocumentDetail'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateDocument
+      tags: [documents]
+      summary: Rename, move, archive or restore a document
+      x-status: pending
+      x-ticket: QS-091
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDocumentRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      operationId: deleteDocument
+      tags: [documents]
+      summary: Move a document to trash, or delete it permanently
+      x-status: pending
+      x-ticket: QS-091
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      parameters:
+        - name: permanent
+          in: query
+          required: false
+          description: When true, deletes the document and its op log instead of moving it to trash. Requires `document:manage`.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/presence:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: getDocumentPresence
+      tags: [collaboration]
+      summary: List peers currently connected to the document's room
+      description: Reads the in-memory room on this process. Returns an empty list when no room is loaded.
+      x-status: implemented
+      responses:
+        '200':
+          description: Connected peers
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/PresencePeer'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/documents/{id}/sync:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: syncDocument
+      tags: [collaboration]
+      summary: WebSocket sync endpoint (upgrade)
+      description: |
+        Upgrades to a WebSocket carrying JSON text frames validated with the shared zod
+        schemas. The upgrade requires a valid `qs_session` cookie and an `Origin`
+        header exactly equal to `APP_ORIGIN`; otherwise the upgrade is refused with 401
+        or 403 before any frame is exchanged. Frames larger than `WS_MAX_MESSAGE_BYTES`
+        (default 262144) close the socket with code 1009.
+
+        The client must send `hello` first. The server answers `welcome` with the ops
+        the client is missing (delta against the client's state vector) and the
+        current peers. Every run in an `ops` frame must carry the `clientId` declared
+        in `hello`; runs with a foreign client id are rejected (`error` CLIENT_MISMATCH). `hello` may be sent only once; binary frames are rejected with BAD_MESSAGE. A document in another organization answers 404.
+        Viewers and commenters may receive but not send `ops`.
+
+        Message schemas: `ClientMessage` and `ServerMessage` (discriminated by `type`);
+        see also `x-websocket-messages` below and docs/api/README.md.
+      x-status: implemented
+      parameters:
+        - name: Connection
+          in: header
+          required: true
+          schema:
+            type: string
+            const: Upgrade
+        - name: Upgrade
+          in: header
+          required: true
+          schema:
+            type: string
+            const: websocket
+        - name: Origin
+          in: header
+          required: true
+          description: Must equal the configured APP_ORIGIN (cross-site WebSocket hijacking defence).
+          schema:
+            type: string
+            format: uri
+        - name: Sec-WebSocket-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Sec-WebSocket-Version
+          in: header
+          required: true
+          schema:
+            type: string
+            const: '13'
+      responses:
+        '101':
+          description: Switching Protocols — the connection now carries `ClientMessage` / `ServerMessage` JSON frames.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: Origin mismatch or no `document:read` permission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          description: Plain HTTP request without upgrade headers
+      x-websocket-messages:
+        encoding: JSON text frames (binary frames for op batches pending QS-055)
+        maxMessageBytes: 262144
+        clientToServer:
+          hello:
+            $ref: '#/components/schemas/HelloMessage'
+          ops:
+            $ref: '#/components/schemas/ClientOpsMessage'
+          presence:
+            $ref: '#/components/schemas/ClientPresenceMessage'
+          ping:
+            $ref: '#/components/schemas/PingMessage'
+        serverToClient:
+          welcome:
+            $ref: '#/components/schemas/WelcomeMessage'
+          ops:
+            $ref: '#/components/schemas/ServerOpsMessage'
+          ack:
+            $ref: '#/components/schemas/AckMessage'
+          presence:
+            $ref: '#/components/schemas/ServerPresenceMessage'
+          peer-left:
+            $ref: '#/components/schemas/PeerLeftMessage'
+          error:
+            $ref: '#/components/schemas/WsErrorMessage'
+          pong:
+            $ref: '#/components/schemas/PongMessage'
+
+  /api/v1/documents/{id}/permissions:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: getDocumentPermissions
+      tags: [sharing]
+      summary: List explicit and inherited permissions on a document
+      x-status: pending
+      x-ticket: QS-092
+      responses:
+        '200':
+          description: Permissions
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/DocumentPermission'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    put:
+      operationId: replaceDocumentPermissions
+      tags: [sharing]
+      summary: Replace the explicit permission grants on a document
+      description: Requires `document:manage`. Downgrades take effect on live sockets with QS-056.
+      x-status: pending
+      x-ticket: QS-092
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplacePermissionsRequest'
+      responses:
+        '200':
+          description: Permissions replaced
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/DocumentPermission'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/share-links:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    post:
+      operationId: createShareLink
+      tags: [sharing]
+      summary: Create a share link with a role and optional expiry
+      description: The raw token is returned once; only its hash is stored.
+      x-status: pending
+      x-ticket: QS-093
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShareLinkRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ShareLink'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/share-links/{shareLinkId}:
+    delete:
+      operationId: revokeShareLink
+      tags: [sharing]
+      summary: Revoke a share link
+      x-status: pending
+      x-ticket: QS-093
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/ShareLinkId'
+      responses:
+        '204':
+          description: Revoked
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/snapshots:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    post:
+      operationId: createSnapshot
+      tags: [versions]
+      summary: Force a snapshot of the document's CRDT state
+      description: Normally snapshots are taken periodically by the server; this endpoint forces one (owners only). Snapshots enable op-log compaction (QS-061).
+      x-status: pending
+      x-ticket: QS-060
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '201':
+          description: Snapshot written
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Snapshot'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: listVersions
+      tags: [versions]
+      summary: List automatic and named versions
+      x-status: pending
+      x-ticket: QS-071
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Versions, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Version'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      operationId: createVersion
+      tags: [versions]
+      summary: Create a named version at the current state vector
+      x-status: pending
+      x-ticket: QS-071
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVersionRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Version'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/versions/{versionId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+      - $ref: '#/components/parameters/VersionId'
+    get:
+      operationId: getVersion
+      tags: [versions]
+      summary: Get a version's text and its diff against another version or the current state
+      x-status: pending
+      x-ticket: QS-072
+      parameters:
+        - name: compareTo
+          in: query
+          required: false
+          description: Version id to diff against; omitted = current document state.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Version detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/VersionDetail'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/versions/{versionId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+      - $ref: '#/components/parameters/VersionId'
+    post:
+      operationId: restoreVersion
+      tags: [versions]
+      summary: Restore a version as forward CRDT operations
+      description: Computes the delete/insert runs that turn the current state into the version's text and applies them as new ops from a server replica, so connected clients converge without a reload and history is preserved.
+      x-status: pending
+      x-ticket: QS-073
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '200':
+          description: Restored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DocumentDetail'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/comments:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: listCommentThreads
+      tags: [comments]
+      summary: List comment threads on a document
+      x-status: pending
+      x-ticket: QS-080
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, resolved, all]
+            default: open
+      responses:
+        '200':
+          description: Threads
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CommentThread'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      operationId: createCommentThread
+      tags: [comments]
+      summary: Start a comment thread anchored to a CRDT range
+      description: Requires `document:comment`. The range is a pair of CRDT anchors, so it stays attached to the same characters under concurrent edits.
+      x-status: pending
+      x-ticket: QS-080
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommentThreadRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CommentThread'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/comments/{commentId}/replies:
+    parameters:
+      - $ref: '#/components/parameters/CommentId'
+    post:
+      operationId: replyToComment
+      tags: [comments]
+      summary: Reply to a comment thread
+      x-status: pending
+      x-ticket: QS-080
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentBody'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/comments/{commentId}:
+    parameters:
+      - $ref: '#/components/parameters/CommentId'
+    patch:
+      operationId: updateComment
+      tags: [comments]
+      summary: Edit a comment body (author only)
+      x-status: pending
+      x-ticket: QS-082
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentBody'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/comments/{commentId}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/CommentId'
+    post:
+      operationId: resolveCommentThread
+      tags: [comments]
+      summary: Resolve or reopen a comment thread
+      x-status: pending
+      x-ticket: QS-082
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveCommentRequest'
+      responses:
+        '200':
+          description: Thread state changed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CommentThread'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/notifications:
+    get:
+      operationId: listNotifications
+      tags: [notifications]
+      summary: List the current user's notifications
+      x-status: pending
+      x-ticket: QS-084
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: unread
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Notifications, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/notifications/{notificationId}/read:
+    post:
+      operationId: markNotificationRead
+      tags: [notifications]
+      summary: Mark a notification as read
+      x-status: pending
+      x-ticket: QS-084
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: Marked read
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/search:
+    get:
+      operationId: search
+      tags: [search]
+      summary: Full-text search over documents the caller can read
+      description: Ranked tsvector search with highlighted snippets; results are filtered by effective permissions (QS-102).
+      x-status: pending
+      x-ticket: QS-101
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Results ordered by rank
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SearchResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/documents/{id}/export:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      operationId: exportDocument
+      tags: [import-export]
+      summary: Export a document as Markdown or sanitized HTML
+      x-status: pending
+      x-ticket: QS-110
+      parameters:
+        - name: format
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [markdown, html]
+      responses:
+        '200':
+          description: Exported file
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+            text/html:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/folders:
+    get:
+      operationId: listFolders
+      tags: [folders]
+      summary: List folders in the current organization
+      x-status: pending
+      x-ticket: QS-090
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: parentId
+          in: query
+          required: false
+          description: Only children of this folder; omitted = root level.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Folders
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Folder'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    post:
+      operationId: createFolder
+      tags: [folders]
+      summary: Create a folder
+      x-status: pending
+      x-ticket: QS-090
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFolderRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Folder'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/folders/{folderId}:
+    parameters:
+      - $ref: '#/components/parameters/FolderId'
+    patch:
+      operationId: updateFolder
+      tags: [folders]
+      summary: Rename or move a folder
+      description: Moving a folder under one of its own descendants returns 409 CONFLICT.
+      x-status: pending
+      x-ticket: QS-090
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFolderRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Folder'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      operationId: deleteFolder
+      tags: [folders]
+      summary: Delete an empty folder
+      x-status: pending
+      x-ticket: QS-090
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/members:
+    get:
+      operationId: listMembers
+      tags: [members]
+      summary: List organization members
+      x-status: pending
+      x-ticket: QS-017
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      operationId: updateMemberRole
+      tags: [members]
+      summary: Change a member's role
+      description: Requires `member:manage`. Demoting the last owner returns 409 CONFLICT.
+      x-status: pending
+      x-ticket: QS-017
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMemberRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Member'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+    delete:
+      operationId: removeMember
+      tags: [members]
+      summary: Remove a member from the organization
+      description: Requires `member:manage`. Revokes the member's sessions in this organization.
+      x-status: pending
+      x-ticket: QS-017
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      responses:
+        '204':
+          description: Removed
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/invitations:
+    post:
+      operationId: createInvitation
+      tags: [members]
+      summary: Invite someone to the organization
+      description: Requires `member:manage`. Writes the invitation email to the local outbox.
+      x-status: pending
+      x-ticket: QS-014
+      security:
+        - sessionCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvitationRequest'
+      responses:
+        '201':
+          description: Invitation created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Invitation'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/invitations/{token}/accept:
+    post:
+      operationId: acceptInvitation
+      tags: [members]
+      summary: Accept an invitation
+      description: A signed-in user joins with the invited role (session + CSRF). A new user supplies `displayName` and `password` and is signed in.
+      x-status: pending
+      x-ticket: QS-014
+      security:
+        - {}
+        - sessionCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: '#/components/parameters/InvitationToken'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptInvitationRequest'
+      responses:
+        '200':
+          description: Joined the organization
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Me'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /api/v1/audit-events:
+    get:
+      operationId: listAuditEvents
+      tags: [audit]
+      summary: Query the organization's audit log
+      description: Requires `audit:read` (owner).
+      x-status: pending
+      x-ticket: QS-019
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: action
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: actorUserId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Audit events, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AuditEvent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: qs_session
+      description: Opaque random 32-byte token (base64url). HttpOnly, SameSite=Lax, Secure when NODE_ENV=production. Server stores only an HMAC-SHA256 of it. Lifetime SESSION_TTL_HOURS (default 168).
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: x-csrf-token
+      description: Must equal the `qs_csrf` cookie value (also returned as `csrfToken` by GET /api/v1/auth/me). Required on POST/PUT/PATCH/DELETE when a session cookie is present.
+
+  headers:
+    SessionSetCookie:
+      description: Sets `qs_session` (HttpOnly) and `qs_csrf` (readable by script for the double-submit header).
+      schema:
+        type: string
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `meta.nextCursor` of the previous page.
+      schema:
+        type: string
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    DocumentId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    FolderId:
+      name: folderId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ShareLinkId:
+      name: shareLinkId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    VersionId:
+      name: versionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CommentId:
+      name: commentId
+      in: path
+      required: true
+      description: Id of a comment; for replies and resolve, the thread's root comment id.
+      schema:
+        type: string
+        format: uuid
+    NotificationId:
+      name: notificationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    InvitationToken:
+      name: token
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 32
+        maxLength: 128
+
+  responses:
+    ValidationError:
+      description: Request failed schema validation (VALIDATION_ERROR)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: VALIDATION_ERROR
+              message: Request body is invalid
+              details:
+                issues:
+                  - path: [title]
+                    message: String must contain at most 200 character(s)
+    Unauthenticated:
+      description: Missing, expired or unknown session (UNAUTHENTICATED)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: UNAUTHENTICATED
+              message: Sign in required
+    CsrfInvalid:
+      description: Missing or mismatched x-csrf-token (CSRF_INVALID)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: CSRF_INVALID
+              message: CSRF token missing or invalid
+    Forbidden:
+      description: Authenticated but lacking the permission, or CSRF_INVALID on a mutating request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: FORBIDDEN
+              message: Missing permission document:edit
+    NotFound:
+      description: Resource does not exist in the caller's organization (NOT_FOUND)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: State conflict, e.g. email already registered (CONFLICT)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    RateLimited:
+      description: Too many attempts (RATE_LIMITED)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Internal:
+      description: Unexpected server error (INTERNAL); details are logged, not returned
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotImplemented:
+      description: Planned endpoint not built yet (NOT_IMPLEMENTED); `error.details.ticket` names the backlog ticket
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            data: null
+            error:
+              code: NOT_IMPLEMENTED
+              message: This endpoint is planned but not implemented yet
+              details:
+                ticket: QS-090
+
+  schemas:
+    # ---------- envelope & errors ----------
+    Envelope:
+      type: object
+      description: Every JSON response. Exactly one of `data` / `error` is non-null.
+      required: [data, error]
+      properties:
+        data:
+          description: Payload; null on error.
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/Error'
+            - type: 'null'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+    PageEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [meta]
+    ErrorEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data:
+          type: 'null'
+        error:
+          $ref: '#/components/schemas/Error'
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Human-readable, safe to show to end users.
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional structured context (validation issues, `ticket` for 501).
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_ERROR
+        - UNAUTHENTICATED
+        - CSRF_INVALID
+        - FORBIDDEN
+        - NOT_FOUND
+        - CONFLICT
+        - RATE_LIMITED
+        - NOT_IMPLEMENTED
+        - INTERNAL
+    PageMeta:
+      type: object
+      properties:
+        nextCursor:
+          type: [string, 'null']
+          description: Pass as `cursor` to fetch the next page; null on the last page.
+        limit:
+          type: integer
+    Ok:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          const: true
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+        uptimeSeconds:
+          type: number
+    ReadinessStatus:
+      type: object
+      required: [status, database, migrations]
+      properties:
+        status:
+          type: string
+          enum: [ready]
+        database:
+          type: string
+          enum: [up]
+        migrations:
+          type: integer
+          description: Number of applied migrations.
+
+    # ---------- identity ----------
+    Role:
+      type: string
+      enum: [owner, editor, commenter, viewer]
+    Permission:
+      type: string
+      enum:
+        - document:read
+        - document:create
+        - document:edit
+        - document:comment
+        - document:manage
+        - member:manage
+        - audit:read
+        - workspace:manage
+    User:
+      type: object
+      required: [id, email, displayName, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          description: Stored lower-case.
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 80
+        createdAt:
+          type: string
+          format: date-time
+    Organization:
+      type: object
+      required: [id, name, slug, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'
+          maxLength: 60
+        createdAt:
+          type: string
+          format: date-time
+    Me:
+      type: object
+      required: [user, organization, role, permissions, csrfToken]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        organization:
+          $ref: '#/components/schemas/Organization'
+        role:
+          $ref: '#/components/schemas/Role'
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Permission'
+        csrfToken:
+          type: string
+          description: Same value as the `qs_csrf` cookie; send as `x-csrf-token`.
+    RegisterRequest:
+      type: object
+      required: [organizationName, displayName, email, password]
+      additionalProperties: false
+      properties:
+        organizationName:
+          type: string
+          minLength: 2
+          maxLength: 120
+          description: The slug is derived from the name plus a random suffix.
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 120
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 10
+          maxLength: 200
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 200
+    PasswordResetRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+    PasswordResetConfirm:
+      type: object
+      required: [token, password]
+      properties:
+        token:
+          type: string
+          minLength: 32
+        password:
+          type: string
+          minLength: 10
+          maxLength: 200
+    Session:
+      type: object
+      required: [id, createdAt, expiresAt, lastSeenAt, current]
+      properties:
+        id:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+        ip:
+          type: [string, 'null']
+        browser:
+          type: [string, 'null']
+          description: Shortened User-Agent header captured at login.
+        current:
+          type: boolean
+          description: True for the session making this request.
+    Member:
+      type: object
+      required: [user, role, joinedAt]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        role:
+          $ref: '#/components/schemas/Role'
+        joinedAt:
+          type: string
+          format: date-time
+    UpdateMemberRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+    Invitation:
+      type: object
+      required: [id, email, role, invitedBy, expiresAt, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+        invitedBy:
+          type: string
+          format: uuid
+        expiresAt:
+          type: string
+          format: date-time
+        acceptedAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    CreateInvitationRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+    AcceptInvitationRequest:
+      type: object
+      description: Required fields only when the invitee has no account yet.
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 80
+        password:
+          type: string
+          minLength: 10
+          maxLength: 200
+    AuditEvent:
+      type: object
+      required: [id, action, createdAt]
+      properties:
+        id:
+          type: string
+          description: bigserial, serialized as a string
+        actorUserId:
+          type: [string, 'null']
+          format: uuid
+        action:
+          type: string
+          examples: [auth.login, document.create]
+        targetType:
+          type: [string, 'null']
+        targetId:
+          type: [string, 'null']
+        metadata:
+          type: object
+          additionalProperties: true
+        requestId:
+          type: [string, 'null']
+        createdAt:
+          type: string
+          format: date-time
+
+    # ---------- documents ----------
+    Document:
+      type: object
+      required: [id, organizationId, title, createdBy, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        folderId:
+          type: [string, 'null']
+          format: uuid
+          description: Present once folders land (QS-090).
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        createdBy:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        archivedAt:
+          type: [string, 'null']
+          format: date-time
+    DocumentDetail:
+      allOf:
+        - $ref: '#/components/schemas/Document'
+        - type: object
+          required: [text, vector, opCount]
+          properties:
+            text:
+              type: string
+              description: Materialized visible text (tombstones removed).
+            vector:
+              $ref: '#/components/schemas/StateVector'
+            opCount:
+              type: integer
+              minimum: 0
+              description: Total individual ops (characters inserted + deleted) in the op log.
+    CreateDocumentRequest:
+      type: object
+      required: [title]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+    UpdateDocumentRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        folderId:
+          type: [string, 'null']
+          format: uuid
+        archived:
+          type: boolean
+    ImportRequest:
+      type: object
+      required: [file]
+      properties:
+        file:
+          type: string
+          contentMediaType: text/markdown
+          description: Markdown file, at most 1 MiB.
+        title:
+          type: string
+          maxLength: 200
+        folderId:
+          type: string
+          format: uuid
+
+    # ---------- folders & sharing ----------
+    Folder:
+      type: object
+      required: [id, organizationId, name, parentId, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        parentId:
+          type: [string, 'null']
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+    CreateFolderRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        parentId:
+          type: [string, 'null']
+          format: uuid
+    UpdateFolderRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        parentId:
+          type: [string, 'null']
+          format: uuid
+    DocumentPermission:
+      type: object
+      required: [userId, role, source]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/Role'
+        source:
+          type: string
+          enum: [organization, folder, document]
+          description: Where the effective grant comes from.
+        folderId:
+          type: [string, 'null']
+          format: uuid
+    ReplacePermissionsRequest:
+      type: object
+      required: [grants]
+      properties:
+        grants:
+          type: array
+          maxItems: 500
+          items:
+            type: object
+            required: [userId, role]
+            properties:
+              userId:
+                type: string
+                format: uuid
+              role:
+                $ref: '#/components/schemas/Role'
+    ShareLink:
+      type: object
+      required: [id, documentId, role, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        documentId:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [viewer, commenter, editor]
+        url:
+          type: string
+          format: uri
+          description: Contains the raw token; returned only by the create call.
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    CreateShareLinkRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [viewer, commenter, editor]
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+
+    # ---------- versions ----------
+    Snapshot:
+      type: object
+      required: [id, documentId, vector, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        documentId:
+          type: string
+          format: uuid
+        vector:
+          $ref: '#/components/schemas/StateVector'
+        sizeBytes:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+    Version:
+      type: object
+      required: [id, documentId, kind, vector, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        documentId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [automatic, named]
+        name:
+          type: [string, 'null']
+          maxLength: 120
+        vector:
+          $ref: '#/components/schemas/StateVector'
+          description: State vector the version captures.
+        createdBy:
+          type: [string, 'null']
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+    VersionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Version'
+        - type: object
+          required: [text, diff]
+          properties:
+            text:
+              type: string
+            diff:
+              type: array
+              items:
+                type: object
+                required: [op, text]
+                properties:
+                  op:
+                    type: string
+                    enum: [equal, insert, delete]
+                  text:
+                    type: string
+    CreateVersionRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+
+    # ---------- comments & notifications ----------
+    CommentAnchor:
+      type: object
+      description: A CRDT position = the item id of the character to the left of the position (null fields = document start). Stays valid when that character is deleted (tombstone).
+      required: [itemClient, itemSeq]
+      properties:
+        itemClient:
+          type: [string, 'null']
+        itemSeq:
+          type: [integer, 'null']
+          minimum: 1
+    CommentRange:
+      type: object
+      required: [start, end]
+      properties:
+        start:
+          $ref: '#/components/schemas/CommentAnchor'
+        end:
+          $ref: '#/components/schemas/CommentAnchor'
+    Comment:
+      type: object
+      required: [id, threadId, authorUserId, body, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        threadId:
+          type: string
+          format: uuid
+        authorUserId:
+          type: string
+          format: uuid
+        body:
+          type: string
+          minLength: 1
+          maxLength: 10000
+        mentions:
+          type: array
+          items:
+            type: string
+            format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        editedAt:
+          type: [string, 'null']
+          format: date-time
+    CommentThread:
+      type: object
+      required: [id, documentId, range, status, comments, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        documentId:
+          type: string
+          format: uuid
+        range:
+          $ref: '#/components/schemas/CommentRange'
+        quotedText:
+          type: string
+          description: Text covered by the range when the thread was created.
+        status:
+          type: string
+          enum: [open, resolved]
+        resolvedBy:
+          type: [string, 'null']
+          format: uuid
+        comments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+        createdAt:
+          type: string
+          format: date-time
+    CommentBody:
+      type: object
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 10000
+    CreateCommentThreadRequest:
+      type: object
+      required: [range, body]
+      properties:
+        range:
+          $ref: '#/components/schemas/CommentRange'
+        body:
+          type: string
+          minLength: 1
+          maxLength: 10000
+    ResolveCommentRequest:
+      type: object
+      required: [resolved]
+      properties:
+        resolved:
+          type: boolean
+    Notification:
+      type: object
+      required: [id, kind, createdAt, readAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [mention, comment_reply, invitation, share]
+        documentId:
+          type: [string, 'null']
+          format: uuid
+        commentId:
+          type: [string, 'null']
+          format: uuid
+        actorUserId:
+          type: [string, 'null']
+          format: uuid
+        summary:
+          type: string
+        readAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    SearchResult:
+      type: object
+      required: [documentId, title, rank, snippet]
+      properties:
+        documentId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        rank:
+          type: number
+        snippet:
+          type: string
+          description: Excerpt with matches wrapped in `<mark>`; all other HTML is escaped.
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ---------- CRDT & sync protocol ----------
+    ClientId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: Random replica id chosen per editor tab.
+    ItemId:
+      type: object
+      required: [client, seq]
+      properties:
+        client:
+          $ref: '#/components/schemas/ClientId'
+        seq:
+          type: integer
+          minimum: 1
+          description: Contiguous per client (1, 2, 3, ...).
+    StateVector:
+      type: object
+      description: Map clientId -> highest contiguous seq integrated.
+      additionalProperties:
+        type: integer
+        minimum: 0
+      examples:
+        - { k3f9a1: 42, p0x7qz: 7 }
+    Anchor:
+      description: CRDT position (item id of the character to the left, null = document start).
+      oneOf:
+        - $ref: '#/components/schemas/ItemId'
+        - type: 'null'
+    InsertRun:
+      type: object
+      description: Consecutive inserts by one client with consecutive seq and lamport, where each character's origin is the previous character. Character i has id {client, seq+i}, lamport lamport+i.
+      required: [k, client, seq, lamport, origin, text]
+      additionalProperties: false
+      properties:
+        k:
+          type: string
+          const: i
+        client:
+          $ref: '#/components/schemas/ClientId'
+        seq:
+          type: integer
+          minimum: 1
+        lamport:
+          type: integer
+          minimum: 1
+        origin:
+          description: Origin of the first character (nearest visible item to the left at creation time); null = document start.
+          oneOf:
+            - $ref: '#/components/schemas/ItemId'
+            - type: 'null'
+        text:
+          type: string
+          minLength: 1
+    DeleteTarget:
+      type: object
+      description: Range of item ids {client, seq} .. {client, seq+len-1} to tombstone.
+      required: [client, seq, len]
+      additionalProperties: false
+      properties:
+        client:
+          $ref: '#/components/schemas/ClientId'
+        seq:
+          type: integer
+          minimum: 1
+        len:
+          type: integer
+          minimum: 1
+    DeleteRun:
+      type: object
+      description: Consecutive delete ops by one client; op j has id {client, seq+j}, lamport lamport+j.
+      required: [k, client, seq, lamport, targets]
+      additionalProperties: false
+      properties:
+        k:
+          type: string
+          const: d
+        client:
+          $ref: '#/components/schemas/ClientId'
+        seq:
+          type: integer
+          minimum: 1
+        lamport:
+          type: integer
+          minimum: 1
+        targets:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/DeleteTarget'
+    Run:
+      oneOf:
+        - $ref: '#/components/schemas/InsertRun'
+        - $ref: '#/components/schemas/DeleteRun'
+      discriminator:
+        propertyName: k
+        mapping:
+          i: '#/components/schemas/InsertRun'
+          d: '#/components/schemas/DeleteRun'
+    PresencePeer:
+      type: object
+      required: [clientId, userId, displayName, color, anchor, focused]
+      properties:
+        clientId:
+          $ref: '#/components/schemas/ClientId'
+        userId:
+          type: string
+          format: uuid
+        displayName:
+          type: string
+        color:
+          type: string
+          pattern: '^#[0-9a-fA-F]{6}$'
+          description: Deterministic colour derived from clientId.
+        anchor:
+          $ref: '#/components/schemas/Anchor'
+        focused:
+          type: boolean
+          description: Whether the peer's editor currently has focus.
+
+    HelloMessage:
+      type: object
+      required: [type, clientId, vector]
+      additionalProperties: false
+      description: The display name comes from the session, not the frame.
+      properties:
+        type:
+          type: string
+          const: hello
+        clientId:
+          $ref: '#/components/schemas/ClientId'
+        vector:
+          $ref: '#/components/schemas/StateVector'
+    ClientOpsMessage:
+      type: object
+      required: [type, runs]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: ops
+        runs:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Run'
+    ClientPresenceMessage:
+      type: object
+      required: [type, anchor, focused]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: presence
+        anchor:
+          $ref: '#/components/schemas/Anchor'
+        focused:
+          type: boolean
+    PingMessage:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: ping
+    ClientMessage:
+      oneOf:
+        - $ref: '#/components/schemas/HelloMessage'
+        - $ref: '#/components/schemas/ClientOpsMessage'
+        - $ref: '#/components/schemas/ClientPresenceMessage'
+        - $ref: '#/components/schemas/PingMessage'
+      discriminator:
+        propertyName: type
+        mapping:
+          hello: '#/components/schemas/HelloMessage'
+          ops: '#/components/schemas/ClientOpsMessage'
+          presence: '#/components/schemas/ClientPresenceMessage'
+          ping: '#/components/schemas/PingMessage'
+
+    WelcomeMessage:
+      type: object
+      required: [type, vector, runs, peers, canEdit]
+      properties:
+        type:
+          type: string
+          const: welcome
+        canEdit:
+          type: boolean
+          description: False for viewers and commenters, whose ops frames are rejected with FORBIDDEN.
+        vector:
+          $ref: '#/components/schemas/StateVector'
+        runs:
+          type: array
+          description: Ops the server has that the hello vector does not cover.
+          items:
+            $ref: '#/components/schemas/Run'
+        peers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PresencePeer'
+    ServerOpsMessage:
+      type: object
+      required: [type, runs, from]
+      properties:
+        type:
+          type: string
+          const: ops
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Run'
+        from:
+          $ref: '#/components/schemas/ClientId'
+    AckMessage:
+      type: object
+      required: [type, vector]
+      properties:
+        type:
+          type: string
+          const: ack
+        vector:
+          $ref: '#/components/schemas/StateVector'
+          description: Server state vector after integrating and persisting the client's batch.
+    ServerPresenceMessage:
+      type: object
+      required: [type, peer]
+      properties:
+        type:
+          type: string
+          const: presence
+        peer:
+          $ref: '#/components/schemas/PresencePeer'
+    PeerLeftMessage:
+      type: object
+      required: [type, clientId]
+      properties:
+        type:
+          type: string
+          const: peer-left
+        clientId:
+          $ref: '#/components/schemas/ClientId'
+    WsErrorMessage:
+      type: object
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          const: error
+        code:
+          type: string
+          enum:
+            [
+              BAD_MESSAGE,
+              NOT_READY,
+              FORBIDDEN,
+              INVALID_OP,
+              CAUSALITY_VIOLATION,
+              CLIENT_MISMATCH,
+              INTERNAL,
+            ]
+        message:
+          type: string
+    PongMessage:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: pong
+    ServerMessage:
+      oneOf:
+        - $ref: '#/components/schemas/WelcomeMessage'
+        - $ref: '#/components/schemas/ServerOpsMessage'
+        - $ref: '#/components/schemas/AckMessage'
+        - $ref: '#/components/schemas/ServerPresenceMessage'
+        - $ref: '#/components/schemas/PeerLeftMessage'
+        - $ref: '#/components/schemas/WsErrorMessage'
+        - $ref: '#/components/schemas/PongMessage'
+      discriminator:
+        propertyName: type
+        mapping:
+          welcome: '#/components/schemas/WelcomeMessage'
+          ops: '#/components/schemas/ServerOpsMessage'
+          ack: '#/components/schemas/AckMessage'
+          presence: '#/components/schemas/ServerPresenceMessage'
+          peer-left: '#/components/schemas/PeerLeftMessage'
+          error: '#/components/schemas/WsErrorMessage'
+          pong: '#/components/schemas/PongMessage'
