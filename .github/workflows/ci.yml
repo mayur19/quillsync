@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://quillsync:quillsync@localhost:5432/quillsync_dev
+      TEST_DATABASE_URL: postgres://quillsync:quillsync@localhost:5432/quillsync_test
+      SESSION_SECRET: ci-only-session-secret-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Native PostgreSQL that ships with the runner image (no service containers).
+      - name: Start PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          pg_isready
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE quillsync LOGIN PASSWORD 'quillsync' CREATEDB;"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE quillsync_test OWNER quillsync;"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE quillsync_dev OWNER quillsync;"
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - run: npm run build
+
+      - name: Migrate and seed with the built CLI
+        run: |
+          node apps/api/dist/db/cli.js migrate
+          node apps/api/dist/db/cli.js seed
