@@ -1,0 +1,40 @@
+:root {
+  --color-bg: #f4efe6;
+  --color-surface: #fffdf8;
+  --color-ink: #1f2a26;
+  --color-muted: #5e6b65;
+  --color-line: #ddd3c2;
+  --color-accent: #2f5d50;
+  --color-accent-ink: #f4efe6;
+  --color-danger: #a63d2f;
+  --color-planned: #8a6d1d;
+  --color-planned-bg: #f6ebc8;
+  --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-doc: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  --radius: 10px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --shadow: 0 1px 2px rgb(31 42 38 / 8%), 0 4px 16px rgb(31 42 38 / 6%);
+  --editor-font-size: 18px;
+  --editor-line-height: 1.6;
+  --editor-padding: 28px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #151b19;
+    --color-surface: #1d2522;
+    --color-ink: #e9e4da;
+    --color-muted: #9aa69f;
+    --color-line: #33403b;
+    --color-accent: #7fb8a4;
+    --color-accent-ink: #10201a;
+    --color-planned: #e2c46b;
+    --color-planned-bg: #3a3320;
+  }
+}
