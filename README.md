@@ -1,72 +1,175 @@
 # quillsync
 
-Real-time collaborative document editing built on an **in-house sequence CRDT**. Several people type into the same document at once, over WebSockets, and every replica converges to the same text regardless of network order, duplication or disconnects. No third-party services: PostgreSQL is the only infrastructure.
+[![CI](https://github.com/mayur19/quillsync/actions/workflows/ci.yml/badge.svg)](https://github.com/mayur19/quillsync/actions/workflows/ci.yml)
 
-> **Status:** foundation plus the first vertical slice (about 11% of the planned 1156 engineering hours, see [implementation status](docs/planning/implementation-status.md)). Everything not yet built is registered in the API and answers `501 NOT_IMPLEMENTED` with its backlog ticket.
+**Write together in real time: every edit converges, even across flaky networks and offline
+stretches, on infrastructure you host yourself.**
 
-## What works today
+quillsync is a self-hosted collaborative document editor for teams that want Google-Docs-style
+co-editing without handing their writing to a third-party service. Several people type into the
+same document over WebSockets; an in-house sequence CRDT (RGA-style, with Lamport stamps,
+tombstones and garbage collection) guarantees that every replica ends up with identical text no
+matter how operations are ordered, duplicated or delayed. PostgreSQL is the only infrastructure:
+it stores accounts, sessions, the audit trail and a durable operation log for every document.
 
-- **CRDT core** (`packages/shared/src/crdt`): RGA-style sequence CRDT with Lamport stamps and contiguous `(client, seq)` ids, tombstones, a causal readiness buffer (any delivery order, any number of duplicates), O(n log n) timestamp-tree batch merge, run-length op compression, a fuzzed binary varint codec, caret/comment anchors and two garbage-collection strategies (childless-tombstone GC and quiescent compaction under causal stability).
-- **Convergence property tests**: 120+ seeded random sessions with 2-5 replicas, random partial/out-of-order/duplicated delivery, checking identical order on every replica and agreement between incremental integration and tree materialization.
-- **Sync server** (`apps/api/src/modules/collab`): one authoritative room per document, a per-room serial queue, persist-before-ack into a Postgres op log (binary batches, idempotent on retry), delta sync from state vectors, presence fan-out, Origin-checked and role-aware WebSocket upgrades.
-- **Web editor** (`apps/web`): plain-text collaborative editor with remote carets anchored to CRDT positions, presence list, reconnect with jittered backoff and resend of unacknowledged edits (offline edits merge on reconnect).
-- **Foundation**: Fastify 5 API with zod validation and a uniform JSON envelope, Postgres sessions (scrypt, HMAC-hashed tokens), CSRF double submit, RBAC (owner/editor/commenter/viewer), audit log, layered login throttling, forward-only SQL migrations, a single `run.sh` launcher.
+> **Project status: early build.** The foundation (auth, sessions, CSRF, RBAC, audit, migrations,
+> launcher, CI), the CRDT core with convergence property tests, the WebSocket sync server with a
+> Postgres op log and presence, and a plain-text collaborative editor are implemented and tested.
+> Everything else (rich text, snapshots, version history, comments, sharing, search, import/export,
+> offline persistence, multi-node scale) is designed, documented and tracked in the
+> [backlog](docs/planning/backlog.md): **11.1 %** of the estimated effort (128 of 1156 hours) is
+> complete per [implementation status](docs/planning/implementation-status.md). Pending API
+> endpoints answer `501 Not Implemented` with their ticket id, and pending screens show a
+> "Planned" badge with the ticket that delivers them.
+
+## Project status
+
+| Area                                                                                                     | Status         | Tickets                  |
+| -------------------------------------------------------------------------------------------------------- | -------------- | ------------------------ |
+| Monorepo, config, error envelope, health, migrations, `run.sh`, CI, 501 registry                         | ✅ Implemented | QS-001 to QS-007, QS-013 |
+| Registration (no enumeration), sessions, CSRF, login throttling, RBAC, audit log                         | ✅ Implemented | QS-008 to QS-012         |
+| CRDT core: ids and vectors, RGA integration, causal buffer, tree merge, codec, GC, anchors, tests        | ✅ Implemented | QS-020 to QS-027         |
+| WebSocket sync, durable op log, presence, document endpoints, web shell, editor, reconnect               | ✅ Implemented | QS-030 to QS-036         |
+| Engineering documentation, ADRs, OpenAPI, backlog                                                        | ✅ Implemented | —                        |
+| Invitations, password reset, session management, members, account settings, audit query, verified signup | ⏳ Pending     | QS-014 to QS-019, QS-140 |
+| Rich-text marks, block model, block moves, indexed sequence, undo, tables, images                        | ⏳ Pending     | QS-040 to QS-047         |
+| Rich-text editor surface, awareness, backpressure, multi-node fan-out, binary frames                     | ⏳ Pending     | QS-050 to QS-057         |
+| Snapshots, op-log compaction, server GC frontier, stale replicas, backup verification                    | ⏳ Pending     | QS-060 to QS-064         |
+| Version history: checkpoints, named versions, diff, restore, retention                                   | ⏳ Pending     | QS-070 to QS-075         |
+| Anchored comments, mentions, notifications, reactions                                                    | ⏳ Pending     | QS-080 to QS-086         |
+| Folders, document lifecycle, per-document permissions, link sharing, templates, activity feed            | ⏳ Pending     | QS-090 to QS-096         |
+| Full-text search (tsvector), ranking, permission filtering, search UI                                    | ⏳ Pending     | QS-100 to QS-104         |
+| Markdown/HTML export, Markdown import, export jobs, workspace archive                                    | ⏳ Pending     | QS-110 to QS-114         |
+| Offline: IndexedDB persistence, offline UX, app shell                                                    | ⏳ Pending     | QS-120 to QS-122         |
+| Metrics, load tests, CSP, accessibility, E2E suite, retention, admin console, deployment, i18n           | ⏳ Pending     | QS-130 to QS-139         |
 
 ## Quick start
 
-Requirements: Node.js 22+, a local PostgreSQL 15+ server (socket in `/tmp`, your OS user, no password).
+Requirements: Node.js 22+, npm, and a local PostgreSQL 15+ server reachable over the Unix socket in
+`/tmp` as your OS user without a password (the defaults in `.env.example`).
 
 ```bash
-./run.sh            # install, create .env with random secrets, create DB, migrate, seed, start API + web
+./run.sh
 ```
 
-Open http://localhost:5104 and sign in with a demo account (development data only, password `quillsync-demo-1`):
+This checks prerequisites, creates `.env` from `.env.example` with a random `SESSION_SECRET`,
+installs dependencies, creates the `quillsync_dev` database, applies migrations, seeds demo data and
+starts:
 
-| Email                  | Role   |
-| ---------------------- | ------ |
-| `ada@northwind.test`   | owner  |
-| `grace@northwind.test` | editor |
-| `linus@northwind.test` | viewer |
+- Web: http://localhost:5104
+- API: http://127.0.0.1:4104 (proxied by the web dev server under `/api`, including the sync
+  WebSocket)
 
-Open the same document in two browsers (or a private window) to watch edits and carets sync.
+Open the same document in two browsers (or a private window) to watch edits, presence and remote
+carets sync.
 
-| Command            | Purpose                                                |
-| ------------------ | ------------------------------------------------------ |
-| `./run.sh help`    | List commands                                          |
-| `./run.sh setup`   | Prepare everything without starting servers            |
-| `./run.sh migrate` | Apply pending migrations                               |
-| `./run.sh seed`    | Load demo data (idempotent)                            |
-| `./run.sh reset`   | Drop, migrate and reseed the dev database              |
-| `./run.sh test`    | Unit and integration tests against `quillsync_test`    |
-| `./run.sh dev`     | Default: setup, then API on :4104 and web on :5104     |
-| `./run.sh check`   | Lint, format check, typecheck and tests (what CI runs) |
-| `./run.sh e2e`     | Playwright smoke and two-browser collaboration specs   |
+## Demo logins (development only)
+
+These accounts are created by the development seed and are public; never load them into a
+production database. Password for all: `quillsync-demo-1`.
+
+| Email                  | Role   | Organization        |
+| ---------------------- | ------ | ------------------- |
+| `ada@northwind.test`   | Owner  | Northwind Editorial |
+| `grace@northwind.test` | Editor | Northwind Editorial |
+| `linus@northwind.test` | Viewer | Northwind Editorial |
+
+Seeded documents: "Q3 launch plan", "Style guide" and "Interview notes". Each is built by
+simulating two replicas editing concurrently and is stored as real op-log batches, so opening one
+rehydrates the CRDT exactly as the sync server would. The viewer account shows the read-only mode.
+
+## run.sh commands
+
+| Command                     | Description                                                               |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `./run.sh` / `./run.sh dev` | Install deps, prepare `.env` + database, migrate, seed, launch API + web  |
+| `./run.sh start`            | Alias of `dev`                                                            |
+| `./run.sh setup`            | Everything `dev` does, without launching                                  |
+| `./run.sh migrate`          | Apply pending database migrations                                         |
+| `./run.sh seed`             | Load development demo data (idempotent)                                   |
+| `./run.sh reset [--yes]`    | Drop and recreate the schema, then migrate + seed (refused in production) |
+| `./run.sh test`             | Unit + integration tests against the `quillsync_test` database            |
+| `./run.sh e2e`              | Playwright end-to-end tests (smoke + two-browser collaboration)           |
+| `./run.sh check`            | Lint, format check, typecheck and tests (what CI runs)                    |
+| `./run.sh build`            | Production build of API and web                                           |
+| `./run.sh help`             | Show all commands                                                         |
+
+## Tech stack
+
+| Layer    | Technology                                                                                          |
+| -------- | --------------------------------------------------------------------------------------------------- |
+| API      | Node.js 22, Fastify 5, @fastify/websocket (ws), @fastify/cookie, TypeScript (strict), zod, pg, pino |
+| Web      | React 18, React Router 6, Vite 5, plain CSS with design tokens                                      |
+| Database | PostgreSQL 15+, forward-only SQL migrations with checksums                                          |
+| Shared   | `@quillsync/shared`: sequence CRDT, sync protocol schemas, RBAC matrix, text diff                   |
+| Tests    | Vitest 3, Testing Library, Fastify inject and real `ws` clients against PostgreSQL, Playwright      |
+| Tooling  | npm workspaces, ESLint 9, Prettier, tsup, tsx, GitHub Actions (native runner PostgreSQL)            |
 
 ## Repository layout
 
 ```
-apps/api/         Fastify 5 API + WebSocket sync server, SQL migrations, integration tests
-apps/web/         React 18 + Vite client (plain CSS design tokens)
-packages/shared/  CRDT, protocol schemas, RBAC matrix, text diff (pure, fully unit tested)
-docs/             product, architecture, ADRs, design, API (OpenAPI 3.1), security, testing, operations, planning
-e2e/              Playwright specs (run locally; not part of CI)
-run.sh            launcher
+quillsync/
+├── apps/
+│   ├── api/                       Fastify API + WebSocket sync server
+│   │   ├── migrations/            0001_foundation.sql, 0002_documents_op_log.sql
+│   │   ├── src/
+│   │   │   ├── config/ db/ http/  env loader, pool + migrator + seed, envelope, CSRF, guards, limiters
+│   │   │   └── modules/
+│   │   │       ├── health/ auth/ audit/    foundation (implemented)
+│   │   │       ├── documents/              list, create, read (implemented)
+│   │   │       ├── collab/                 rooms, op log, sync protocol (implemented slice)
+│   │   │       └── pending/                registry of planned routes answering 501
+│   │   └── test/                  integration tests against real PostgreSQL and ws clients
+│   └── web/                       React SPA
+│       └── src/
+│           ├── collab/            sync client: outbox, reconnect, resend (implemented)
+│           ├── pages/             login, register, documents, editor (implemented); PlannedPage
+│           └── components/        app shell, presence list, remote carets
+├── packages/shared/
+│   ├── src/crdt/                  ids, integration, causal buffer, tree merge, runs, codec, GC, anchors
+│   ├── src/protocol/ rbac/ schemas/ text/
+│   └── test/                      unit, property (convergence) and fuzz tests
+├── e2e/                           Playwright config, smoke and collaboration specs
+├── docs/                          product, architecture, ADRs, design, API, security, testing, ops, planning
+├── run.sh                         single entry point
+└── .env.example                   placeholder configuration
 ```
-
-## Quality gates
-
-`npm run lint && npm run format:check && npm run typecheck && npm test && npm run build` all pass locally and in CI (GitHub Actions on the runner's native PostgreSQL; no containers). 361 tests: shared 251, API 86, web 24. Coverage thresholds are enforced per workspace (statements: shared ~99%, API ~97%, web ~98%).
 
 ## Documentation
 
-Start at [docs/README.md](docs/README.md). Highlights:
+Start with the [documentation index](docs/README.md). Key documents:
+[PRD](docs/product/PRD.md) ·
+[requirements](docs/product/requirements.md) ·
+[architecture](docs/architecture/overview.md) ·
+[ADRs](docs/adr/README.md) ·
+[data model](docs/design/data-model.md) ·
+[system design](docs/design/system-design.md) ·
+[API](docs/api/README.md) ·
+[OpenAPI](docs/api/openapi.yaml) ·
+[threat model](docs/security/threat-model.md) ·
+[test strategy](docs/testing/test-strategy.md) ·
+[runbook](docs/operations/runbook.md) ·
+[deployment](docs/operations/deployment.md) ·
+[roadmap](docs/planning/roadmap.md) ·
+[backlog](docs/planning/backlog.md) ·
+[implementation status](docs/planning/implementation-status.md)
 
-- [System design](docs/design/system-design.md): the CRDT algorithms with proofs sketches and complexity, sync sequences, consistency strategy
-- [ADRs](docs/adr/README.md): 21 decisions, from "RGA over YATA/Logoot/OT" to "persist before ack"
-- [OpenAPI](docs/api/openapi.yaml): full target API with `x-status: implemented | pending`
-- [Backlog](docs/planning/backlog.md) and [roadmap](docs/planning/roadmap.md)
-- [Threat model](docs/security/threat-model.md)
+## Known limitations
 
-## License
+- The editor is plain text in a textarea; rich text and blocks are pending (QS-040, QS-041, QS-050).
+- Rooms live in one API process and login/registration throttle counters are in memory, so run a
+  single instance until multi-node fan-out moves them to PostgreSQL (QS-053, QS-054).
+- No snapshots yet: rooms rehydrate from the full op log, and the GC library is not wired to the
+  server, so tombstones and deleted text stay in storage (QS-060 to QS-062).
+- Offline edits survive a disconnect but not a page reload (IndexedDB persistence is QS-120).
+- Registration activates accounts immediately; email verification through the local outbox is
+  QS-140.
+- Playwright specs are not run in CI (no browsers on the runner); run them locally with
+  `./run.sh e2e`.
 
-MIT, see [LICENSE](LICENSE).
+## Contributing, security and license
+
+- [Contributing guide](CONTRIBUTING.md): workflow, migrations, commit conventions.
+- [Security policy](SECURITY.md): how to report vulnerabilities; security model summary.
+- [Changelog](CHANGELOG.md).
+- Licensed under the [MIT License](LICENSE).
